@@ -59,50 +59,76 @@ def is_today(email_date):
     return email_date_utc.date() == now.date()
 
 
+def to_markdown_table(headers, rows):
+    """Format a list of rows into a markdown table Claude renders nicely."""
+    if not rows:
+        return None
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join(["---"] * len(headers)) + "|",
+    ]
+    for row in rows:
+        # Escape pipe characters so they don't break the table structure
+        safe_row = [str(cell).replace("|", "/") for cell in row]
+        lines.append("| " + " | ".join(safe_row) + " |")
+    return "\n".join(lines)
+
+
+def parse_classification(classification: str):
+    """Split a classify_email result into (category, reason)."""
+    category = "Unknown"
+    reason = ""
+    for line in classification.splitlines():
+        if line.startswith("Category:"):
+            category = line.replace("Category:", "").strip()
+        elif line.startswith("Reason:"):
+            reason = line.replace("Reason:", "").strip()
+    return category, reason
+
+
 @mcp.tool()
 def list_recent_emails(max_results: int = 5) -> str:
     """
-    List the most recent emails in the inbox.
+    List the most recent emails in the inbox, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many recent emails to fetch.
 
     Returns:
-    str: A formatted list of email ID, sender, and subject for each email.
+    str: A markdown table of email ID, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(userId="me", maxResults=max_results).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
-        lines.append(f"ID: {msg['id']} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], sender, subject))
 
-    if not lines:
-        return "No recent emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "From", "Subject"], rows)
+    return table or "No recent emails found."
 
 
 @mcp.tool()
 def list_todays_emails(max_results: int = 20) -> str:
     """
-    List emails received today only.
+    List emails received today only, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many recent emails to scan (only today's are returned).
 
     Returns:
-    str: A formatted list of today's emails' ID, time, sender, and subject.
+    str: A markdown table of today's emails' ID, time, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(userId="me", maxResults=max_results).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
@@ -114,11 +140,10 @@ def list_todays_emails(max_results: int = 20) -> str:
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
         time_str = email_date.strftime("%H:%M") if email_date else "unknown time"
-        lines.append(f"ID: {msg['id']} | Time: {time_str} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], time_str, sender, subject))
 
-    if not lines:
-        return "No emails received today."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "Time", "From", "Subject"], rows)
+    return table or "No emails received today."
 
 
 def get_email_body(service, email_id):
@@ -199,21 +224,20 @@ def star_email(email_id: str) -> str:
 def find_important_unstarred(max_results: int = 10, today_only: bool = False) -> str:
     """
     Scan recent emails, classify each one, and return the ones judged
-    Urgent or Important that are not already starred. Each result
-    includes the date/time the email was received.
+    Urgent or Important that are not already starred, as a markdown table.
 
     Parameters:
     max_results (int): How many recent emails to scan.
     today_only (bool): If True, only consider emails received today.
 
     Returns:
-    str: A list of matching emails with their date, subject, and reason.
+    str: A markdown table of matching emails with date, subject, category, and reason.
     """
     service = get_gmail_service()
     results = service.users().messages().list(userId="me", maxResults=max_results).execute()
     messages = results.get("messages", [])
 
-    flagged = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         label_ids = msg_data.get("labelIds", [])
@@ -228,16 +252,18 @@ def find_important_unstarred(max_results: int = 10, today_only: bool = False) ->
             continue
 
         classification = classify_email(msg["id"])
+        category, reason = parse_classification(classification)
 
-        if "Category: Urgent" in classification or "Category: Important" in classification:
+        if category in ("Urgent", "Important"):
             subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
             date_str = email_date.strftime("%Y-%m-%d %H:%M") if email_date else "unknown date"
-            flagged.append(f"ID: {msg['id']} | Date: {date_str} | Subject: {subject} | {classification}")
+            rows.append((msg["id"], date_str, subject, category, reason))
 
-    if not flagged:
-        scope = "today" if today_only else "recent emails"
-        return f"No important unstarred emails found in {scope}."
-    return "\n".join(flagged)
+    table = to_markdown_table(["ID", "Date", "Subject", "Category", "Reason"], rows)
+    if table:
+        return table
+    scope = "today" if today_only else "recent emails"
+    return f"No important unstarred emails found in {scope}."
 
 
 def build_raw_message(to: str, subject: str, body: str) -> str:
@@ -248,6 +274,23 @@ def build_raw_message(to: str, subject: str, body: str) -> str:
     message["to"] = to
     message["subject"] = subject
     return b64.urlsafe_b64encode(message.as_bytes()).decode()
+
+
+def get_draft_content(service, draft_id):
+    """Fetch a draft's to/subject/body as plain values."""
+    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    msg = draft["message"]
+    headers = msg["payload"]["headers"]
+
+    to = next((h["value"] for h in headers if h["name"] == "To"), "")
+    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+
+    body_data = msg["payload"].get("body", {}).get("data", "")
+    if not body_data and "parts" in msg["payload"]:
+        body_data = msg["payload"]["parts"][0]["body"].get("data", "")
+
+    body_text = b64.urlsafe_b64decode(body_data).decode("utf-8") if body_data else ""
+    return to, subject, body_text
 
 
 @mcp.tool()
@@ -295,9 +338,10 @@ Rough draft: {rough_text}"""
 @mcp.tool()
 def update_draft(draft_id: str, to: str, subject: str, rough_text: str) -> str:
     """
-    Edit an existing draft — replaces its recipient, subject, and body.
-    Runs the new text through the same grammar/tone cleanup as
-    create_draft. Still saved as a draft only, never sent.
+    Replace an existing draft entirely with new content — use this when
+    you want to rewrite the draft from scratch. Runs the new text through
+    the same grammar/tone cleanup as create_draft. To make a small change
+    to existing text instead (e.g. "remove this line"), use edit_draft.
 
     Parameters:
     draft_id (str): The Gmail draft ID to update.
@@ -336,11 +380,76 @@ Rough draft: {rough_text}"""
 
 
 @mcp.tool()
+def edit_draft(draft_id: str, instruction: str) -> str:
+    """
+    Make a targeted edit to an EXISTING draft's body, based on the
+    current content plus a plain-English instruction (e.g. "remove the
+    line about not attending the test" or "make it more formal").
+    Keeps the same recipient and subject unless the instruction says
+    otherwise. Still saved as a draft only, never sent.
+
+    Parameters:
+    draft_id (str): The Gmail draft ID to edit.
+    instruction (str): Plain-English description of the change to make.
+
+    Returns:
+    str: Confirmation message, including the updated body for review.
+    """
+    service = get_gmail_service()
+    to, subject, current_body = get_draft_content(service, draft_id)
+
+    prompt = f"""Here is the current email body:
+
+---
+{current_body}
+---
+
+Apply this edit: {instruction}
+
+Return ONLY the full updated email body, nothing else — no subject
+line, no explanation, no markers like "---"."""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    updated_body = response.choices[0].message.content
+
+    raw_message = build_raw_message(to, subject, updated_body)
+    service.users().drafts().update(
+        userId="me",
+        id=draft_id,
+        body={"message": {"raw": raw_message}},
+    ).execute()
+
+    return f"Draft {draft_id} edited.\n\nUpdated content:\nTo: {to}\nSubject: {subject}\n\n{updated_body}"
+
+
+@mcp.tool()
+def delete_draft(draft_id: str) -> str:
+    """
+    Permanently delete a draft. This does not affect any sent email —
+    only removes the draft itself.
+
+    Parameters:
+    draft_id (str): The Gmail draft ID to delete.
+
+    Returns:
+    str: Confirmation message.
+    """
+    service = get_gmail_service()
+    service.users().drafts().delete(userId="me", id=draft_id).execute()
+    return f"Draft {draft_id} deleted."
+
+
+@mcp.tool()
 def send_draft(draft_id: str) -> str:
     """
     Send an existing draft as-is. THIS IS IRREVERSIBLE — the email will
     actually be delivered to the recipient. Always confirm the draft's
-    content with get_draft before calling this.
+    content with get_draft before calling this. Once sent, it will also
+    appear in list_sent_emails (Gmail applies this automatically).
 
     Parameters:
     draft_id (str): The Gmail draft ID to send.
@@ -359,13 +468,15 @@ def send_draft(draft_id: str) -> str:
 @mcp.tool()
 def list_sent_emails(max_results: int = 10) -> str:
     """
-    List emails you have sent to others.
+    List emails you have sent to others, formatted as a markdown table.
+    This includes emails sent via send_draft, since Gmail automatically
+    labels sent drafts the same as any other sent email.
 
     Parameters:
     max_results (int): How many sent emails to fetch.
 
     Returns:
-    str: A formatted list of sent emails' ID, recipient, and subject.
+    str: A markdown table of sent emails' ID, recipient, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(
@@ -373,17 +484,16 @@ def list_sent_emails(max_results: int = 10) -> str:
     ).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         recipient = next((h["value"] for h in headers if h["name"] == "To"), "(unknown recipient)")
-        lines.append(f"ID: {msg['id']} | To: {recipient} | Subject: {subject}")
+        rows.append((msg["id"], recipient, subject))
 
-    if not lines:
-        return "No sent emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "To", "Subject"], rows)
+    return table or "No sent emails found."
 
 
 @mcp.tool()
@@ -409,13 +519,13 @@ def archive_email(email_id: str) -> str:
 @mcp.tool()
 def list_archived_emails(max_results: int = 10) -> str:
     """
-    List emails that have been archived (not in Inbox, not Trash).
+    List emails that have been archived, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many archived emails to fetch.
 
     Returns:
-    str: A formatted list of archived emails' ID, sender, and subject.
+    str: A markdown table of archived emails' ID, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(
@@ -423,29 +533,28 @@ def list_archived_emails(max_results: int = 10) -> str:
     ).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
-        lines.append(f"ID: {msg['id']} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], sender, subject))
 
-    if not lines:
-        return "No archived emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "From", "Subject"], rows)
+    return table or "No archived emails found."
 
 
 @mcp.tool()
 def list_spam_emails(max_results: int = 10) -> str:
     """
-    List emails currently in Spam.
+    List emails currently in Spam, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many spam emails to fetch.
 
     Returns:
-    str: A formatted list of spam emails' ID, sender, and subject.
+    str: A markdown table of spam emails' ID, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(
@@ -453,29 +562,28 @@ def list_spam_emails(max_results: int = 10) -> str:
     ).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
-        lines.append(f"ID: {msg['id']} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], sender, subject))
 
-    if not lines:
-        return "No spam emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "From", "Subject"], rows)
+    return table or "No spam emails found."
 
 
 @mcp.tool()
 def list_trash_emails(max_results: int = 10) -> str:
     """
-    List emails currently in Trash.
+    List emails currently in Trash, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many trashed emails to fetch.
 
     Returns:
-    str: A formatted list of trashed emails' ID, sender, and subject.
+    str: A markdown table of trashed emails' ID, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(
@@ -483,29 +591,28 @@ def list_trash_emails(max_results: int = 10) -> str:
     ).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
-        lines.append(f"ID: {msg['id']} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], sender, subject))
 
-    if not lines:
-        return "No trashed emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "From", "Subject"], rows)
+    return table or "No trashed emails found."
 
 
 @mcp.tool()
 def list_starred_emails(max_results: int = 10) -> str:
     """
-    List emails currently starred in Gmail.
+    List emails currently starred in Gmail, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many starred emails to fetch.
 
     Returns:
-    str: A formatted list of starred emails' ID, sender, and subject.
+    str: A markdown table of starred emails' ID, sender, and subject.
     """
     service = get_gmail_service()
     results = service.users().messages().list(
@@ -513,17 +620,16 @@ def list_starred_emails(max_results: int = 10) -> str:
     ).execute()
     messages = results.get("messages", [])
 
-    lines = []
+    rows = []
     for msg in messages:
         msg_data = service.users().messages().get(userId="me", id=msg["id"]).execute()
         headers = msg_data["payload"]["headers"]
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown sender)")
-        lines.append(f"ID: {msg['id']} | From: {sender} | Subject: {subject}")
+        rows.append((msg["id"], sender, subject))
 
-    if not lines:
-        return "No starred emails found."
-    return "\n".join(lines)
+    table = to_markdown_table(["ID", "From", "Subject"], rows)
+    return table or "No starred emails found."
 
 
 @mcp.tool()
@@ -538,48 +644,37 @@ def get_draft(draft_id: str) -> str:
     str: The recipient, subject, and full body text of the draft.
     """
     service = get_gmail_service()
-    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
-    msg = draft["message"]
-    headers = msg["payload"]["headers"]
-
-    to = next((h["value"] for h in headers if h["name"] == "To"), "(no recipient)")
-    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
-
-    body_data = msg["payload"].get("body", {}).get("data", "")
-    if not body_data and "parts" in msg["payload"]:
-        body_data = msg["payload"]["parts"][0]["body"].get("data", "")
-
-    body_text = b64.urlsafe_b64decode(body_data).decode("utf-8") if body_data else "(empty body)"
-
+    to, subject, body_text = get_draft_content(service, draft_id)
+    if not body_text:
+        body_text = "(empty body)"
     return f"To: {to}\nSubject: {subject}\n\n{body_text}"
 
 
 @mcp.tool()
 def list_drafts(max_results: int = 10) -> str:
     """
-    List all current drafts with their IDs and subjects.
+    List all current drafts, formatted as a markdown table.
 
     Parameters:
     max_results (int): How many drafts to fetch.
 
     Returns:
-    str: A formatted list of draft ID, recipient, and subject.
+    str: A markdown table of draft ID, recipient, and subject.
     """
     service = get_gmail_service()
     results = service.users().drafts().list(userId="me", maxResults=max_results).execute()
     drafts = results.get("drafts", [])
 
-    lines = []
+    rows = []
     for d in drafts:
         draft = service.users().drafts().get(userId="me", id=d["id"]).execute()
         headers = draft["message"]["payload"]["headers"]
         to = next((h["value"] for h in headers if h["name"] == "To"), "(no recipient)")
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
-        lines.append(f"Draft ID: {d['id']} | To: {to} | Subject: {subject}")
+        rows.append((d["id"], to, subject))
 
-    if not lines:
-        return "No drafts found."
-    return "\n".join(lines)
+    table = to_markdown_table(["Draft ID", "To", "Subject"], rows)
+    return table or "No drafts found."
 
 
 if __name__ == "__main__":
